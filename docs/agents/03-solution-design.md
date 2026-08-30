@@ -23,8 +23,9 @@
 
 以下规则用于设计和评审完整方案。“Cube 操作”是矩阵乘及必要的矩阵累加；其余逐元素、归约、广播、layout、cast、copy 和 mask 等属于“Vector 操作”。“驻留区”是数据生产后继续保存在 L1 或 UB、供后续 Stage 使用的区域。
 
-- **R01**：每个 Stage 保持类型单一，统一包含 Cube 操作或 Vector 操作。
+- **R01**：每个 Stage 保持类型单一，统一包含 Cube 操作或 Vector 操作；一个 Stage 可以包含多个同类型操作。由于一个 C 核对应两个 V 核，Cube Stage 中每个操作都展开为四份，由 AIC 依次完成 `hv0、hv1、hv2、hv3`；Vector Stage 中每个操作都展开为两份，由 AIV0 接收 `hv0、hv2`、AIV1 接收 `hv1、hv3`。
 - **R02**：Cube Stage 的全部输入由前序 Stage 或算子输入提供；Vector Stage 内的后续计算可以依赖本 Stage 前面产生的 Vector 结果。一个 Stage 完成后，其结果可作为后继 Stage 的输入。
+- **R02-A**：Cube Stage 中的矩阵乘、矩阵累加和带转置的 GEMM 必须使用 `@` 表达矩阵运算，格式为 `C = A @ B`，并通过旁注同时注明操作数 shape、物理 layout/transpose、累加 dtype 和 Fixpipe 写出。禁止使用 `sum_i`、`sum_j` 等逐元素求和式作为 matmul 的主语义描述；逐元素 `sum` 仅可用于明确标注为 Vector reduction 的非-GEMM 计算。
 - **R03**：容量上限使用目标 SoC 可供算子使用的 L1 和 UB 容量；设计文档记录目标 SoC、容量依据和实际可用上限。L1 只用于 Cube 路径，UB 只用于 Vector 路径。
 - **R04**：Cube 结果后续要被 Vector 使用且不是算子最终输出时，必须放入 UB 驻留区，并为该数据预留 `2` 份等大空间。
 - **R05**：Vector 结果后续还要被 Vector 使用且不是算子最终输出时，必须放入 UB 驻留区，并为该数据预留 `2` 份等大空间。
@@ -41,7 +42,7 @@
 - **R16**：Vector 路径复用需要多次使用的 Vector 结果，优先放入驻留区，并在容量表中记录生命周期。
 - **R17**：L1 和 UB 中仍然有效的数据保留原地址；地址规划预留足够大的连续区间，并计算总空闲空间和最大连续空闲区，确认二者都满足分配需求。
 - **R18**：同一语义、不同 head 的数据执行相同操作并采用相同的存放位置。
-- **R19**：在满足以上全部规则的前提下，Stage 数量保持最少。
+- **R19**：Stage 划分首先检查合并后完整活跃数据的 L1、UB、L0 容量和生命周期。若空间足够，则只按真实数据依赖和 Cube/Vector 类型边界拆分，并取最少 Stage；若空间不足，优先评估按 R14 将中间结果写回 GM 后保持更少 Stage，只有 GM 中转无法满足正确性、生命周期或性能目标时才拆分 Stage。无论采用哪种方式，都应取满足约束的最少 Stage。
 
 ## 设计文档内容
 
@@ -60,7 +61,7 @@
 每个 Stage 使用 `Stage <编号>：<Cube/Vector>，<目的>` 作为标题，并写清：
 
 1. 公式、计算顺序、shape、有效长度、dtype 和最终输出关系。
-2. 输入来源、前置与并行 Stage，以及 batch/chunk/task/head/head ratio 和 AIC/AIV 分工。
+2. 输入来源、前置与并行 Stage，以及 batch/chunk、value head `hv`、q/k source head `hk` 的映射、head ratio 和 AIC/AIV 分工。
 3. L1/UB 绝对半开区间、tensor、大小、对齐、份数、读写方、首次写入、最后消费和复用条件。
 4. GM/workspace 的 offset、大小、搬入、写回、生命周期，以及 `R14` 中转的原因和代价。
 5. 搬运、计算、原位覆盖、写回和释放的实际执行顺序。
