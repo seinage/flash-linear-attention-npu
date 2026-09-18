@@ -181,6 +181,128 @@ __simd_vf__ inline void MulRowsByFactorsAddRegbase(__ubuf__ float *dst, __ubuf__
     }
 }
 
+__simd_vf__ inline void StateUpdateFuseRegbase(__ubuf__ float *state, __ubuf__ float *termQ,
+                                               __ubuf__ float *termW, float scale, uint16_t elements)
+{
+    // 单 pass 完成 state += termQ * scale - termW（替换 Muls/Sub/Add 三个标量 API
+    // 与其间的 4 个 PipeBarrier：state/termQ/termW 只经寄存器一趟）
+    constexpr uint32_t ELEMS_PER_VF = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+    const uint16_t loopCnt = static_cast<uint16_t>((elements + ELEMS_PER_VF - 1) / ELEMS_PER_VF);
+
+    RegTensor<float> stateReg;
+    RegTensor<float> termQReg;
+    RegTensor<float> termWReg;
+    RegTensor<float> tmpReg;
+    MaskReg maskFull = CreateMask<float, MaskPattern::ALL>();
+    #pragma unroll 2
+    for (uint16_t loopIdx = 0; loopIdx < loopCnt; ++loopIdx) {
+        const uint32_t elemOffset = loopIdx * ELEMS_PER_VF;
+        LoadAlign(stateReg, state + elemOffset);
+        LoadAlign(termQReg, termQ + elemOffset);
+        LoadAlign(termWReg, termW + elemOffset);
+        Muls(tmpReg, termQReg, scale, maskFull);
+        Sub(tmpReg, tmpReg, termWReg, maskFull);
+        Add(stateReg, stateReg, tmpReg, maskFull);
+        StoreAlign(state + elemOffset, stateReg, maskFull);
+    }
+}
+
+// fp32 → DT 输出 cast 的 CastTrait：与原 AscendC::Cast(CAST_RINT) 舍入语义一致
+// （注意与 fwd_o 的 CAST_ROUND 不同，本算子输出舍入必须保持 RINT）
+template <typename DT>
+constexpr CastTrait BWD_DHU_FP32_TO_DT_PACK = {
+    RegLayout::ZERO,
+    SatMode::NO_SAT,
+    MaskMergeMode::MERGING,
+    AscendC::RoundMode::CAST_RINT,
+};
+
+// zero/one 交织对合回 DT 的 RINT 版（regbase.hpp 的 CastFloat2Half 为 CAST_ROUND，
+// 本算子 qg 链末端舍入须保持 RINT；One/ZERO 布局与 MERGING/ZEROING 模式与其一致）。
+// trait 必须在命名空间作用域：Cast 的 trait 模板形参为引用型 NTTP，
+// 要求实参具有静态存储期（函数内局部 constexpr 无法绑定，编译报
+// "invalid explicitly-specified argument for template parameter 'trait'"）
+constexpr CastTrait ctFp322HalfOneRint = {
+    RegLayout::ONE,
+    SatMode::NO_SAT,
+    MaskMergeMode::ZEROING,
+    AscendC::RoundMode::CAST_RINT,
+};
+constexpr CastTrait ctFp322HalfZeroRint = {
+    RegLayout::ZERO,
+    SatMode::NO_SAT,
+    MaskMergeMode::MERGING,
+    AscendC::RoundMode::CAST_RINT,
+};
+
+template <typename TType>
+__simd_callee__ inline void CastFloat2HalfRint(RegTensor<TType>& dstReg, RegTensor<float>& srcZeroReg,
+                                               RegTensor<float>& srcOneReg, MaskReg& mask)
+{
+    Cast<TType, float, ctFp322HalfOneRint>(dstReg, srcOneReg, mask);
+    Cast<TType, float, ctFp322HalfZeroRint>(dstReg, srcZeroReg, mask);
+}
+
+template <typename DT>
+__simd_vf__ inline void CastFp32ToOutputRegbase(__ubuf__ DT *dst, __ubuf__ float *src, uint16_t elements)
+{
+    // fp32 → DT 寄存器内 cast 直写输出缓冲（替换 CopyOutFp32Rows 的标量
+    // AscendC::Cast；fp32 读一趟、DT 写一趟，无中间 API 边界）
+    constexpr uint32_t ELEMS_PER_VF = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+    const uint16_t loopCnt = static_cast<uint16_t>((elements + ELEMS_PER_VF - 1) / ELEMS_PER_VF);
+
+    RegTensor<float> srcReg;
+    RegTensor<DT> dstReg;
+    MaskReg maskFull = CreateMask<float, MaskPattern::ALL>();
+    #pragma unroll 2
+    for (uint16_t loopIdx = 0; loopIdx < loopCnt; ++loopIdx) {
+        const uint32_t elemOffset = loopIdx * ELEMS_PER_VF;
+        LoadAlign(srcReg, src + elemOffset);
+        Cast<DT, float, BWD_DHU_FP32_TO_DT_PACK<DT>>(dstReg, srcReg, maskFull);
+        StoreAlign<DT, StoreDist::DIST_PACK_B32>(dst + elemOffset, dstReg, maskFull);
+    }
+}
+
+template <typename DT, bool USE_FACTOR>
+__simd_vf__ inline void QgProduceFuseRegbase(__ubuf__ DT *dst, __ubuf__ DT *src,
+                                             __ubuf__ float *factors, uint16_t rowCount,
+                                             uint16_t colCount)
+{
+    // qg 链单 pass：q(DT) → fp32 → [×行因子(exp(g))] → cast DT(RINT) → outputBuf。
+    // 替换 CastInputRows + PipeBarrier + MulRowsByFactors + PipeBarrier + 标量 Cast
+    // 三段两 barrier；fp32 中间量只经寄存器不落 UB。USE_FACTOR=false 对应
+    // USE_GK=1（q 不乘因子，纯 DT→DT 量化），factors 不被解引用。
+    // 布局：CastHalf2Float 产出 zero/one 交织对，算术分别进行后经
+    // CastFloat2HalfRint（One+Zero 两次 cast）合回 DT，PACK 直写。
+    constexpr uint32_t ELEMS_PER_VF = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+    const uint16_t colLoop = static_cast<uint16_t>((colCount + ELEMS_PER_VF - 1) / ELEMS_PER_VF);
+
+    RegTensor<DT> srcReg;
+    RegTensor<float> srcZeroReg;
+    RegTensor<float> srcOneReg;
+    RegTensor<float> factorReg;
+    RegTensor<DT> dstReg;
+    MaskReg maskFull32 = CreateMask<float, MaskPattern::ALL>();
+    MaskReg maskFull16 = CreateMask<half, MaskPattern::ALL>();
+    #pragma unroll 2
+    for (uint16_t row = 0; row < rowCount; ++row) {
+        if constexpr (USE_FACTOR) {
+            LoadIn<float, true>(factorReg, factors + row);
+        }
+        for (uint16_t colIdx = 0; colIdx < colLoop; ++colIdx) {
+            const uint32_t elemOffset = row * colCount + colIdx * ELEMS_PER_VF;
+            LoadIn<DT, false>(srcReg, src + elemOffset);
+            CastHalf2Float<DT>(srcZeroReg, srcOneReg, srcReg, maskFull16);
+            if constexpr (USE_FACTOR) {
+                Mul(srcZeroReg, srcZeroReg, factorReg, maskFull32);
+                Mul(srcOneReg, srcOneReg, factorReg, maskFull32);
+            }
+            CastFloat2HalfRint<DT>(dstReg, srcZeroReg, srcOneReg, maskFull32);
+            StoreAlign<DT, StoreDist::DIST_PACK_B32>(dst + elemOffset, dstReg, maskFull32);
+        }
+    }
+}
+
 template <typename DT, typename GT, int USE_GK>
 class ChunkGatedDeltaRuleBwdDhuVector {
 public:
@@ -463,21 +585,28 @@ public:
                             const uint32_t qIdx = CopyInRows(
                                 qGm_, qInputBuf_[curQInputPingPong_], qBase + rowOffset * K_,
                                 static_cast<uint32_t>(curRows * K_));
-                            AscendC::LocalTensor<float> qFp32 = qFp32Buf_.template Get<float>();
-                            CastInputRows(qFp32, qInputBuf_[qIdx], static_cast<uint32_t>(curRows * K_), qIdx);
-                            AscendC::PipeBarrier<PIPE_V>();
-                            if constexpr (USE_GK == 0) {
-                                MulRowsByFactorsRegbase(
-                                    (__ubuf__ float *)reinterpret_cast<uint64_t>(qFp32.GetPhyAddr()),
-                                    (__ubuf__ float *)reinterpret_cast<uint64_t>(qFp32.GetPhyAddr()),
-                                    ((__ubuf__ float *)reinterpret_cast<uint64_t>(gateFactor.GetPhyAddr())) + rowOffset,
-                                    static_cast<uint16_t>(curRows), static_cast<uint16_t>(K_));
-                                AscendC::PipeBarrier<PIPE_V>();
-                            }
+                            // qg 单 pass VF：cast→mul→cast 全寄存器（消 fp32 中转与
+                            // 2 个 PipeBarrier）；MTE2→V 等待 + 槽位归还（V_MTE2）
+                            // 与原 CastInputRows 的握手语义一致
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(qMte2ToVEvent_[qIdx]);
                             const uint32_t outputIdx = curOutputPingPong_;
                             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent_[outputIdx]);
-                            AscendC::Cast(outputBuf_[outputIdx], qFp32, AscendC::RoundMode::CAST_RINT,
-                                          static_cast<uint32_t>(curRows * K_));
+                            if constexpr (USE_GK == 0) {
+                                QgProduceFuseRegbase<DT, true>(
+                                    (__ubuf__ DT *)reinterpret_cast<uint64_t>(outputBuf_[outputIdx].GetPhyAddr()),
+                                    (__ubuf__ DT *)reinterpret_cast<uint64_t>(qInputBuf_[qIdx].GetPhyAddr()),
+                                    ((__ubuf__ float *)reinterpret_cast<uint64_t>(gateFactor.GetPhyAddr())) + rowOffset,
+                                    static_cast<uint16_t>(curRows), static_cast<uint16_t>(K_));
+                            } else {
+                                // USE_GK=1：不乘因子（USE_FACTOR=false 时 factors 不解引用），
+                                // 传 dst 占位避免 nullptr 转换告警
+                                QgProduceFuseRegbase<DT, false>(
+                                    (__ubuf__ DT *)reinterpret_cast<uint64_t>(outputBuf_[outputIdx].GetPhyAddr()),
+                                    (__ubuf__ DT *)reinterpret_cast<uint64_t>(qInputBuf_[qIdx].GetPhyAddr()),
+                                    (__ubuf__ float *)reinterpret_cast<uint64_t>(outputBuf_[outputIdx].GetPhyAddr()),
+                                    static_cast<uint16_t>(curRows), static_cast<uint16_t>(K_));
+                            }
+                            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(qVToMte2Event_[qIdx]);
                             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[outputIdx]);
                             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[outputIdx]);
                             const AscendC::DataCopyParams qgCopyParams{
@@ -624,11 +753,14 @@ public:
                         AscendC::LocalTensor<float> stateFp32 = stateBuf_[stateIdx];
                         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(stateMte2ToVEvent_[stateIdx]);
                         AscendC::PipeBarrier<PIPE_V>();
-                        AscendC::Muls(termQFp32, termQFp32, scale_, elems);
-                        AscendC::PipeBarrier<PIPE_V>();
-                        AscendC::Sub(termQFp32, termQFp32, outFp32, elems);
-                        AscendC::PipeBarrier<PIPE_V>();
-                        AscendC::Add(stateFp32, stateFp32, termQFp32, elems);
+                        // 单 pass VF 融合：state += termQ*scale - termW（消 3 个标量 API 与
+                        // 中间 3 个 PipeBarrier；scale 先提局部变量避免 VF 内成员访问破坏融合）
+                        const float scaleLocal = scale_;
+                        StateUpdateFuseRegbase(
+                            (__ubuf__ float *)reinterpret_cast<uint64_t>(stateFp32.GetPhyAddr()),
+                            (__ubuf__ float *)reinterpret_cast<uint64_t>(termQFp32.GetPhyAddr()),
+                            (__ubuf__ float *)reinterpret_cast<uint64_t>(outFp32.GetPhyAddr()),
+                            scaleLocal, static_cast<uint16_t>(elems));
                         AscendC::PipeBarrier<PIPE_V>();
                         CopyOutStateRows(stateIdx, stateFp32, stateBase + rowElems, elems);
                     }
@@ -773,7 +905,12 @@ private:
     {
         const uint32_t outputIdx = curOutputPingPong_;
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent_[outputIdx]);
-        AscendC::Cast(outputBuf_[outputIdx], srcTensor, AscendC::RoundMode::CAST_RINT, elements);
+        CastFp32ToOutputRegbase<DT>(
+            (__ubuf__ DT *)reinterpret_cast<uint64_t>(outputBuf_[outputIdx].GetPhyAddr()),
+            (__ubuf__ float *)reinterpret_cast<uint64_t>(srcTensor.GetPhyAddr()),
+            static_cast<uint16_t>(elements));
+        // Set/Wait 配对不可拆：DataCopy 在 MTE3 流水发射前必须等 V 写完 outputBuf
+        // （删除该 Wait 会导致 MTE3 先于 VF cast 读缓冲的数据竞争）
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[outputIdx]);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[outputIdx]);
         AscendC::DataCopy(outTensor[outOffset], outputBuf_[outputIdx], elements);
