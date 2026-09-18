@@ -380,6 +380,12 @@ public:
                         cachedKResidentValid_ = false;
                     }
 
+                    // early-notify（对齐 stage2 模式）：GEMM0(dvState) 完成即通知 AIV，
+                    // 不等 GEMM1(termQ)。dvState 可见性由 CV per-tile flag（bf16）或
+                    // 同 pipe GM 保序（V=256 回退分支）保证，与 mode-2 通知时机解耦；
+                    // GEMM1 写 termQ workspace 与 AIV stage1 消费无数据依赖。
+                    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+
                     auto tensorTermQ = tla::MakeTensor(gmTermQ, layoutTermQ, Catlass::Arch::PositionGM{});
                     auto blockTermQ = tla::GetTile(
                         tensorTermQ, tla::MakeCoord(0, 0),
@@ -402,8 +408,6 @@ public:
                         false, false, 0, true, true, doScratchEvent,
                         static_cast<uint32_t>(K_), static_cast<uint32_t>(V_DIM),
                         static_cast<uint32_t>(chunkInfo.chunkLen));
-
-                    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
                 }
                 for (int64_t headOffset = 0; headOffset < headCnt; ++headOffset) {
                     const int64_t hv = hvBase + headOffset;
