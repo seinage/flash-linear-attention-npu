@@ -294,6 +294,9 @@ public:
                                 needLoadKResident, releaseKAfterUse, kResidentEvent, true, true, stateScratchEvent,
                                 static_cast<uint32_t>(chunkInfo.chunkLen), static_cast<uint32_t>(V_DIM),
                                 static_cast<uint32_t>(K_));
+                            // GM 回退分支的 early-notify：dvState 的 L0C→GM 写与 set
+                            // 同在 PIPE_FIX 保序（与 CV 分支的提前 set 互斥，每 head 恰 1 次）
+                            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
                         } else {
                             uint32_t mActual = static_cast<uint32_t>(chunkInfo.chunkLen);
                             if (mActual == 1) {
@@ -370,6 +373,11 @@ public:
                             }
 
                             SwitchL0C();
+                            // early-notify（与 stage2 :595 同构）：set 提前到 Mmad 排空
+                            // 等待与 CV 推送循环之前——AIV 在 GEMM0 尾部即被放行进入
+                            // S1，dvState 逐 tile 可见性仍由 mode-4 ready 保证，
+                            // coarse gate 只负责放行。
+                            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
                             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEvent);
                             uint32_t cvListId = 0;
                             uint32_t rowIdx = 0;
@@ -408,16 +416,12 @@ public:
                             needLoadKResident, releaseKAfterUse, kResidentEvent, true, true, stateScratchEvent,
                             static_cast<uint32_t>(chunkInfo.chunkLen), static_cast<uint32_t>(V_DIM),
                             static_cast<uint32_t>(K_));
+                        // 非 bf16 GM 分支的 early-notify（同 useGmDvState 分支语义）
+                        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
                     }
                     if (releaseKAfterUse) {
                         cachedKResidentValid_ = false;
                     }
-
-                    // early-notify（对齐 stage2 模式）：GEMM0(dvState) 完成即通知 AIV，
-                    // 不等 GEMM1(termQ)。dvState 可见性由 CV per-tile flag（bf16）或
-                    // 同 pipe GM 保序（V=256 回退分支）保证，与 mode-2 通知时机解耦；
-                    // GEMM1 写 termQ workspace 与 AIV stage1 消费无数据依赖。
-                    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
 
                     auto tensorTermQ = tla::MakeTensor(gmTermQ, layoutTermQ, Catlass::Arch::PositionGM{});
                     auto blockTermQ = tla::GetTile(
