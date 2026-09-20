@@ -288,15 +288,16 @@ public:
                         const bool useGmDvState = V_DIM == 256 && chunkInfo.chunkLen > 64;
                         if (useGmDvState) {
                             CopyL0CToGm_DvState<decltype(blockDvState)> copyL0CToGm_DvState;
+                            // GM 回退分支的 early-notify（C5）：由 RunResidentMmad epilogue
+                            // 在 L0C→GM 写前发射（同 PIPE_FIX 保序），替代原先调用后的显式 set
+                            earlyNotifyStage_ = true;
                             RunResidentMmad<LayoutTagL0A_DvState, LayoutTagL0B_DvState>(
                                 copyL1ToL0A_DvState, copyL1ToL0B_DvState, tileMmadDvState, copyL0CToGm_DvState,
                                 tensorL1K, tensorL1State, blockDvState, l0A, l0B, l0C,
                                 needLoadKResident, releaseKAfterUse, kResidentEvent, true, true, stateScratchEvent,
                                 static_cast<uint32_t>(chunkInfo.chunkLen), static_cast<uint32_t>(V_DIM),
                                 static_cast<uint32_t>(K_));
-                            // GM 回退分支的 early-notify：dvState 的 L0C→GM 写与 set
-                            // 同在 PIPE_FIX 保序（与 CV 分支的提前 set 互斥，每 head 恰 1 次）
-                            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+                            earlyNotifyStage_ = false;
                         } else {
                             uint32_t mActual = static_cast<uint32_t>(chunkInfo.chunkLen);
                             if (mActual == 1) {
@@ -410,14 +411,15 @@ public:
                         }
                     } else {
                         CopyL0CToGm_DvState<decltype(blockDvState)> copyL0CToGm_DvState;
+                        // 非 bf16 GM 分支的 early-notify（C5，同 useGmDvState 分支）
+                        earlyNotifyStage_ = true;
                         RunResidentMmad<LayoutTagL0A_DvState, LayoutTagL0B_DvState>(
                             copyL1ToL0A_DvState, copyL1ToL0B_DvState, tileMmadDvState, copyL0CToGm_DvState,
                             tensorL1K, tensorL1State, blockDvState, l0A, l0B, l0C,
                             needLoadKResident, releaseKAfterUse, kResidentEvent, true, true, stateScratchEvent,
                             static_cast<uint32_t>(chunkInfo.chunkLen), static_cast<uint32_t>(V_DIM),
                             static_cast<uint32_t>(K_));
-                        // 非 bf16 GM 分支的 early-notify（同 useGmDvState 分支语义）
-                        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+                        earlyNotifyStage_ = false;
                     }
                     if (releaseKAfterUse) {
                         cachedKResidentValid_ = false;
@@ -516,13 +518,15 @@ public:
                         const bool useGmTermW = V_DIM == 256 && chunkInfo.chunkLen > 64;
                         if (useGmTermW) {
                             CopyL0CToGm_TermW<decltype(blockTermW)> copyL0CToGm_TermW;
+                            // GM 回退分支的 early-notify（C5）：epilogue 内 L0C→GM 写前发射
+                            earlyNotifyStage_ = true;
                             RunResidentMmad<LayoutTagL0A_TermW, LayoutTagL0B_TermW>(
                                 copyL1ToL0A_TermW, copyL1ToL0B_TermW, tileMmadTermW, copyL0CToGm_TermW,
                                 tensorL1WT, tensorL1Dv2, blockTermW, l0A, l0B, l0C,
                                 true, true, wEvent, true, true, dv2ScratchEvent,
                                 static_cast<uint32_t>(K_), static_cast<uint32_t>(V_DIM),
                                 static_cast<uint32_t>(chunkInfo.chunkLen));
-                            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+                            earlyNotifyStage_ = false;
                         } else {
                             const uint32_t l0CSlot = curL0C_;
                             const int32_t l0CEvent = L0CEvent(l0CSlot);
@@ -630,13 +634,15 @@ public:
                         }
                     } else {
                         CopyL0CToGm_TermW<decltype(blockTermW)> copyL0CToGm_TermW;
+                        // 非 bf16 GM 分支的 early-notify（C5，同 useGmTermW 分支）
+                        earlyNotifyStage_ = true;
                         RunResidentMmad<LayoutTagL0A_TermW, LayoutTagL0B_TermW>(
                             copyL1ToL0A_TermW, copyL1ToL0B_TermW, tileMmadTermW, copyL0CToGm_TermW,
                             tensorL1WT, tensorL1Dv2, blockTermW, l0A, l0B, l0C,
                             true, true, wEvent, true, true, dv2ScratchEvent,
                             static_cast<uint32_t>(K_), static_cast<uint32_t>(V_DIM),
                             static_cast<uint32_t>(chunkInfo.chunkLen));
-                        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+                        earlyNotifyStage_ = false;
                     }
                 }
             }
@@ -950,6 +956,14 @@ private:
         SwitchL0C();
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEvent);
         copyL0CToGm(tensorBlockC, tensorL0C, 0b11);
+        // GM 回退路径的 early-notify：必须排在 copyL0CToGm 之后（同 PIPE_FIX
+        // 按序执行 → GM 写完成先于 flag 可见）。GM 路径无 per-tile mode-4 保护，
+        // coarse set 即 dvState/termW 的可见性保证——放在 copy 之前会让 AIV
+        // 读到未写入的数据（C5 v1 轮 case-4 fp16 精度失败的根因）。相比原
+        // "调用返回后再 set"，此处 set 已进入 FIX 指令流，免标量线程后续路径。
+        if (earlyNotifyStage_) {
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+        }
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEvent);
     }
 
@@ -963,6 +977,9 @@ private:
     GM_ADDR chunkIndices_ = nullptr;
     Catlass::Arch::CrossCoreFlag vecToCubeFlag_{VEC_TO_CUBE_FLAG_READY};
     Catlass::Arch::CrossCoreFlag cubeToVecFlag_{CUBE_TO_VEC_FLAG_READY};
+    // RunResidentMmad epilogue 是否发射 cubeToVec early-notify（GM 回退分支专用；
+    // AIC 标量单线程，调用前设置、模板内消费，无需原子性考虑）
+    bool earlyNotifyStage_ = false;
     const ChunkGatedDeltaRuleBwdDhuTilingData *tiling_ = nullptr;
     int64_t B_ = 0;
     int64_t HK_ = 0;
