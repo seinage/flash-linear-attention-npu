@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include <exe_graph/runtime/storage_shape.h>
 #include <register/op_impl_registry.h>
@@ -46,7 +47,6 @@ static constexpr int64_t CHUNK_SIZE_128 = 128;
 static constexpr int64_t CHUNK_INDICES_PAIR = 2;
 static constexpr int64_t VAR_LEN_B = 1;
 static constexpr int64_t HEADS_PER_TASK = 4;
-static constexpr int64_t MAX_TASKS_PER_CORE = 4;
 static constexpr int64_t WORKSPACE_BUFFER_COUNT = 8;
 static constexpr uint64_t VECTOR_SUB_BLOCK_NUM = 2;
 static constexpr uint64_t DTYPE_SIZE_HALF = 2;
@@ -485,15 +485,34 @@ private:
     ge::graphStatus WorkspaceTiling()
     {
         const uint32_t maxBlockDim = ctx_.aicCoreNum == 0 ? 1U : ctx_.aicCoreNum;
-        const int64_t totalHeadTaskNum = tiling_.seqNum * tiling_.HV;
-        tiling_.headsPerTask = std::min(
-            HEADS_PER_TASK, CeilDiv(totalHeadTaskNum, static_cast<int64_t>(maxBlockDim)));
+        // 分核重估（2026-09-20）：blockDim 一律 min(maxBlockDim, taskNum)。task 不足核数
+        // 时收缩避免空核（空核仍参与启动期 SyncAll 与 workspace 计费）；task 足够时满核。
+        // 旧 targetTaskPerCore 公式在 29~111 task 区间为凑每核 ≥3 task 收缩核数，case0
+        // （64 task）被压到 22/28 核，但临界路径 task 数不变（ceil(64/22)=ceil(64/28)=3），
+        // 6 个 AIC 纯闲置。
+        // headsPerTask 按临界路径成本枚举 h ∈ [1, min(4, HV)] 取最小、并列取更大 h（task
+        // 数更少、per-task 开销更低）：每 task 墙钟 ≈ max(h, ceil(h/2)·R) + O——AIC 串行
+        // 处理 task 内全部 h 个 head，AIV 按 headOffset 奇偶平分 2 个 subblock；R 为
+        // AIV/AIC 单 head 链成本比、O 为每 task 流水线填充/排空，R≈1.6、O≈0.25 条 head
+        // 链由 case0/case1 实测反解。成本以 1/20 head 链定点整数计：max(20h, 32·ceil(h/2))+5。
+        const int64_t maxHeads = std::min<int64_t>(HEADS_PER_TASK, tiling_.HV);
+        int64_t bestHeads = maxHeads;
+        int64_t bestCost = std::numeric_limits<int64_t>::max();
+        for (int64_t heads = 1; heads <= maxHeads; ++heads) {
+            const int64_t taskNum = tiling_.seqNum * CeilDiv(tiling_.HV, heads);
+            const int64_t rounds = CeilDiv(taskNum, std::min<int64_t>(maxBlockDim, taskNum));
+            const int64_t aivChains = (heads + 1) / 2;
+            const int64_t cost = rounds * (std::max(20 * heads, 32 * aivChains) + 5);
+            if (cost <= bestCost) {
+                bestCost = cost;
+                bestHeads = heads;
+            }
+        }
+        tiling_.headsPerTask = bestHeads;
         tiling_.headWindowNum = CeilDiv(tiling_.HV, tiling_.headsPerTask);
         tiling_.taskNum = tiling_.seqNum * tiling_.headWindowNum;
-        const int64_t targetTaskPerCore = std::min(
-            MAX_TASKS_PER_CORE, CeilDiv(tiling_.taskNum, static_cast<int64_t>(maxBlockDim)));
-        blockDim_ = std::min(
-            maxBlockDim, static_cast<uint32_t>(CeilDiv(tiling_.taskNum, targetTaskPerCore)));
+        blockDim_ = static_cast<uint32_t>(
+            std::min<int64_t>(maxBlockDim, tiling_.taskNum));
 
         const uint64_t qSize = DtypeSize(ctx_.qDataType);
         tiling_.dh0ClearCoreNum = 0;
