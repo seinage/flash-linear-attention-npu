@@ -180,10 +180,15 @@ public:
                     AscendC::GlobalTensor<DT> gmDO;
                     AscendC::GlobalTensor<DT> gmTermQ;
                     gmK.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(k_) + kBase);
+                    // K 为一次性流式读（组内复用走 L1 kResident，与 L2 无关），
+                    // 禁 L2 防止无收益的写分配驱逐 dh/dv2 生产者-消费者行（fwd_o 先例）
+                    gmK.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
                     gmState.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dh_) + dhBase);
                     gmDvState.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(workspace_) + slotBase +
                                               dvStateWorkspaceOffset_);
                     gmDO.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dO_) + dOBase);
+                    // dO 同为一次性流式读，禁 L2（见 gmK 注释）
+                    gmDO.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
                     gmTermQ.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(workspace_) + slotBase +
                                             termQWorkspaceOffset_);
 
@@ -241,6 +246,7 @@ public:
                         const int64_t wBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * K_;
                         AscendC::GlobalTensor<DT> gmWT;
                         gmWT.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(w_) + wBase);
+                        gmWT.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
                         auto tensorWT = tla::MakeTensor(gmWT, layoutWT, Catlass::Arch::PositionGM{});
                         auto blockWT = tla::GetTile(
                             tensorWT, tla::MakeCoord(0, 0),
@@ -479,6 +485,7 @@ public:
                         const int64_t wBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * K_;
                         AscendC::GlobalTensor<DT> gmWT;
                         gmWT.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(w_) + wBase);
+                        gmWT.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
                         auto tensorWT = tla::MakeTensor(gmWT, layoutWT, Catlass::Arch::PositionGM{});
                         auto blockWT = tla::GetTile(
                             tensorWT, tla::MakeCoord(0, 0),
