@@ -228,6 +228,33 @@ public:
                     copyGmToL1B_DO(tensorL1DO, blockDO);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(doScratchEvent);
 
+                    // W^T 提前装载：W 零跨核依赖，在 stage1 阻塞等待前发起 GM→L1A，
+                    // 填充 MTE2 空闲窗口（stage2 GEMM2 消费时 W 必然已就绪）。W 驻留仅
+                    // 双槽而窗口至多 4 head（headOffset 奇偶各占一槽），仅每槽首次使用
+                    // （headOffset 0/1）在此预取：headOffset>=2 若也在此装载，其 Wait 将
+                    // 等同槽前序 W 在 stage2 GEMM2 释放，而 stage2 又被 stage1 阻塞 → 死锁。
+                    // 槽位信用来自上一 chunk stage2 末片释放或 InitPipeFlags 预置。
+                    if (headOffset < static_cast<int64_t>(W_RESIDENT_BUFFER_COUNT)) {
+                        const uint32_t residentSlot = static_cast<uint32_t>(workspaceSlot) & 1U;
+                        LayoutTagWT tagWT = LayoutTagWT::MakeLayout<DT>(K_, chunkSize_);
+                        auto layoutWT = tla::MakeLayoutFromTag(tagWT);
+                        const int64_t wBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * K_;
+                        AscendC::GlobalTensor<DT> gmWT;
+                        gmWT.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(w_) + wBase);
+                        auto tensorWT = tla::MakeTensor(gmWT, layoutWT, Catlass::Arch::PositionGM{});
+                        auto blockWT = tla::GetTile(
+                            tensorWT, tla::MakeCoord(0, 0),
+                            tla::MakeShape(static_cast<uint32_t>(K_),
+                                           static_cast<uint32_t>(chunkInfo.chunkLen)));
+                        CopyGmToL1A_TermW<decltype(blockWT)> copyGmToL1A_WT;
+                        const int32_t wEvent = WResidentEvent(residentSlot);
+                        auto tensorL1WT =
+                            tla::MakeTensor(wResident[residentSlot], L1A_LAYOUT_WT, Catlass::Arch::PositionL1{});
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(wEvent);
+                        copyGmToL1A_WT(tensorL1WT, blockWT);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(wEvent);
+                    }
+
                     Catlass::Arch::CrossCoreWaitFlag(vecToCubeFlag_);
 
                     auto tensorState = tla::MakeTensor(gmState, layoutState, Catlass::Arch::PositionGM{});
@@ -412,40 +439,30 @@ public:
                 for (int64_t headOffset = 0; headOffset < headCnt; ++headOffset) {
                     const int64_t hv = hvBase + headOffset;
                     const int64_t workspaceSlot = windowStartSlot + headOffset;
-                    const int64_t wBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * K_;
                     const int64_t dv2Base = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * V_;
                     const int64_t slotBase = WorkspaceBase(blockIdx, workspaceSlot);
                     const uint32_t residentSlot = static_cast<uint32_t>(workspaceSlot) & 1U;
 
-                    LayoutTagWT tagWT = LayoutTagWT::MakeLayout<DT>(K_, chunkSize_);
                     LayoutTagDv2 tagDv2 = LayoutTagDv2::MakeLayout<DT>(chunkSize_, V_DIM);
                     LayoutTagTermW tagTermW = LayoutTagTermW::MakeLayout<DT>(K_, V_DIM);
 
-                    auto layoutWT = tla::MakeLayoutFromTag(tagWT);
                     auto layoutDv2 = tla::MakeLayoutFromTag(tagDv2);
                     auto layoutTermW = tla::MakeLayoutFromTag(tagTermW);
 
-                    AscendC::GlobalTensor<DT> gmWT;
                     AscendC::GlobalTensor<DT> gmDv2;
                     AscendC::GlobalTensor<DT> gmTermW;
-                    gmWT.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(w_) + wBase);
                     gmDv2.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dv2_) + dv2Base);
                     gmTermW.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(workspace_) + slotBase +
                                             termWWorkspaceOffset_);
 
-                    auto tensorWT = tla::MakeTensor(gmWT, layoutWT, Catlass::Arch::PositionGM{});
                     auto tensorDv2 = tla::MakeTensor(gmDv2, layoutDv2, Catlass::Arch::PositionGM{});
                     auto tensorTermW = tla::MakeTensor(gmTermW, layoutTermW, Catlass::Arch::PositionGM{});
-                    auto blockWT = tla::GetTile(
-                        tensorWT, tla::MakeCoord(0, 0),
-                        tla::MakeShape(static_cast<uint32_t>(K_), static_cast<uint32_t>(chunkInfo.chunkLen)));
                     auto blockDv2 = tla::GetTile(
                         tensorDv2, tla::MakeCoord(0, 0),
                         tla::MakeShape(static_cast<uint32_t>(chunkInfo.chunkLen), static_cast<uint32_t>(V_DIM)));
                     auto blockTermW = tla::GetTile(
                         tensorTermW, tla::MakeCoord(0, 0),
                         tla::MakeShape(static_cast<uint32_t>(K_), static_cast<uint32_t>(V_DIM)));
-                    CopyGmToL1A_TermW<decltype(blockWT)> copyGmToL1A_WT;
                     CopyGmToL1B_TermW<decltype(blockDv2)> copyGmToL1B_Dv2;
                     CopyL1ToL0A_TermW copyL1ToL0A_TermW;
                     CopyL1ToL0B_TermW copyL1ToL0B_TermW;
@@ -454,9 +471,24 @@ public:
                     const int32_t wEvent = WResidentEvent(residentSlot);
                     auto tensorL1WT =
                         tla::MakeTensor(wResident[residentSlot], L1A_LAYOUT_WT, Catlass::Arch::PositionL1{});
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(wEvent);
-                    copyGmToL1A_WT(tensorL1WT, blockWT);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(wEvent);
+                    if (headOffset >= static_cast<int64_t>(W_RESIDENT_BUFFER_COUNT)) {
+                        // head 2/3：W 未在 stage1 预取（双槽容量约束，见 stage1 注释），
+                        // 按原时序在此装载；同奇偶槽已被本 chunk 更早的 GEMM2 末片释放。
+                        LayoutTagWT tagWT = LayoutTagWT::MakeLayout<DT>(K_, chunkSize_);
+                        auto layoutWT = tla::MakeLayoutFromTag(tagWT);
+                        const int64_t wBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * K_;
+                        AscendC::GlobalTensor<DT> gmWT;
+                        gmWT.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(w_) + wBase);
+                        auto tensorWT = tla::MakeTensor(gmWT, layoutWT, Catlass::Arch::PositionGM{});
+                        auto blockWT = tla::GetTile(
+                            tensorWT, tla::MakeCoord(0, 0),
+                            tla::MakeShape(static_cast<uint32_t>(K_),
+                                           static_cast<uint32_t>(chunkInfo.chunkLen)));
+                        CopyGmToL1A_TermW<decltype(blockWT)> copyGmToL1A_WT;
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(wEvent);
+                        copyGmToL1A_WT(tensorL1WT, blockWT);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(wEvent);
+                    }
 
                     Catlass::Arch::CrossCoreWaitFlag(vecToCubeFlag_);
 

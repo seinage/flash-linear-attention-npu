@@ -221,40 +221,6 @@ __simd_vf__ inline void MulRowsByFactorsAddRegbase(__ubuf__ float *dst, __ubuf__
     }
 }
 
-template <typename DT>
-__simd_vf__ inline void MulRowsByFactorsAddCastOutRegbase(__ubuf__ DT *dst, __ubuf__ float *src,
-                                                          __ubuf__ float *factors, __ubuf__ float *add,
-                                                          uint16_t rowCount, uint16_t colCount)
-{
-    // dv2 尾部融合单 pass：×gate 因子 + 加 dv + fp32→DT cast 直写 outputBuf。
-    // 替换 MulRowsByFactorsAddRegbase（fp32 落 UB）+ PipeBarrier +
-    // CopyOutFp32Rows 的 cast 段——fp32 中间量只经寄存器不落 UB。
-    // RINT 舍入与原 AscendC::Cast(CAST_RINT) 一致（trait 同 opt2）。
-    constexpr uint32_t ELEMS_PER_VF = AscendC::VECTOR_REG_WIDTH / sizeof(float);
-    const uint16_t colLoop = static_cast<uint16_t>((colCount + ELEMS_PER_VF - 1) / ELEMS_PER_VF);
-
-    RegTensor<float> srcReg;
-    RegTensor<float> factorReg;
-    RegTensor<float> addReg;
-    RegTensor<float> tmpReg;
-    RegTensor<DT> dstReg;
-    MaskReg maskFull32 = CreateMask<float, MaskPattern::ALL>();
-    #pragma unroll 2
-    for (uint16_t row = 0; row < rowCount; ++row) {
-        LoadIn<float, true>(factorReg, factors + row);
-        for (uint16_t colIdx = 0; colIdx < colLoop; ++colIdx) {
-            const uint32_t colOffset = colIdx * ELEMS_PER_VF;
-            const uint32_t elemOffset = row * colCount + colOffset;
-            LoadAlign(srcReg, src + elemOffset);
-            LoadAlign(addReg, add + elemOffset);
-            Mul(tmpReg, srcReg, factorReg, maskFull32);
-            Add(tmpReg, tmpReg, addReg, maskFull32);
-            Cast<DT, float, BWD_DHU_FP32_TO_DT_PACK<DT>>(dstReg, tmpReg, maskFull32);
-            StoreAlign<DT, StoreDist::DIST_PACK_B32>(dst + elemOffset, dstReg, maskFull32);
-        }
-    }
-}
-
 __simd_vf__ inline void StateUpdateFuseRegbase(__ubuf__ float *state, __ubuf__ float *termQ,
                                                __ubuf__ float *termW, float scale, uint16_t elements)
 {
@@ -308,6 +274,40 @@ __simd_vf__ inline void CastFp32ToOutputRegbase(__ubuf__ DT *dst, __ubuf__ float
         LoadAlign(srcReg, src + elemOffset);
         Cast<DT, float, BWD_DHU_FP32_TO_DT_PACK<DT>>(dstReg, srcReg, maskFull);
         StoreAlign<DT, StoreDist::DIST_PACK_B32>(dst + elemOffset, dstReg, maskFull);
+    }
+}
+
+template <typename DT>
+__simd_vf__ inline void MulRowsByFactorsAddCastOutRegbase(__ubuf__ DT *dst, __ubuf__ float *src,
+                                                          __ubuf__ float *factors, __ubuf__ float *add,
+                                                          uint16_t rowCount, uint16_t colCount)
+{
+    // dv2 尾部融合单 pass：×gate 因子 + 加 dv + fp32→DT cast 直写 outputBuf。
+    // 替换 MulRowsByFactorsAddRegbase（fp32 落 UB）+ PipeBarrier +
+    // CopyOutFp32Rows 的 cast 段——fp32 中间量只经寄存器不落 UB。
+    // RINT 舍入与原 AscendC::Cast(CAST_RINT) 一致（trait 同 opt2）。
+    constexpr uint32_t ELEMS_PER_VF = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+    const uint16_t colLoop = static_cast<uint16_t>((colCount + ELEMS_PER_VF - 1) / ELEMS_PER_VF);
+
+    RegTensor<float> srcReg;
+    RegTensor<float> factorReg;
+    RegTensor<float> addReg;
+    RegTensor<float> tmpReg;
+    RegTensor<DT> dstReg;
+    MaskReg maskFull32 = CreateMask<float, MaskPattern::ALL>();
+    #pragma unroll 2
+    for (uint16_t row = 0; row < rowCount; ++row) {
+        LoadIn<float, true>(factorReg, factors + row);
+        for (uint16_t colIdx = 0; colIdx < colLoop; ++colIdx) {
+            const uint32_t colOffset = colIdx * ELEMS_PER_VF;
+            const uint32_t elemOffset = row * colCount + colOffset;
+            LoadAlign(srcReg, src + elemOffset);
+            LoadAlign(addReg, add + elemOffset);
+            Mul(tmpReg, srcReg, factorReg, maskFull32);
+            Add(tmpReg, tmpReg, addReg, maskFull32);
+            Cast<DT, float, BWD_DHU_FP32_TO_DT_PACK<DT>>(dstReg, tmpReg, maskFull32);
+            StoreAlign<DT, StoreDist::DIST_PACK_B32>(dst + elemOffset, dstReg, maskFull32);
+        }
     }
 }
 
