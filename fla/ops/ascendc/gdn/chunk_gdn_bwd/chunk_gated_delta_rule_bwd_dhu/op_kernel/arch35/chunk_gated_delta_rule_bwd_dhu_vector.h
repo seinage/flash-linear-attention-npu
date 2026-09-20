@@ -86,28 +86,68 @@ __simd_vf__ inline void FillFloatRegbase(__ubuf__ float *dst, float value, uint1
     }
 }
 
-__simd_vf__ inline void ExpScalarSubFloatRegbase(__ubuf__ float *dst, __ubuf__ float *src,
-                                                 __ubuf__ float *scalar, uint16_t elements, bool useExp2)
+__simd_vf__ inline void GateDualFactorFuseRegbase(__ubuf__ float *gateFactor, __ubuf__ float *dvGateFactor,
+                                                  __ubuf__ float *gateRaw, uint16_t elements,
+                                                  __ubuf__ float *gateLast, bool useExp2)
 {
+    // gate 双系数合并单 pass：一次 Load g 同时产出两张驻留表——
+    //   gateFactor[i]   = exp(g[i] * ln2?)（qg 链与 state decay 用）
+    //   dvGateFactor[i] = exp((g_last - g[i]) * ln2?)（dv2 合成用）
+    // 替换原"头部分散两趟（Muls+Exp）+ 尾部再一趟（Sub+Muls+Exp，经
+    // ExpScalarSubFloatRegbase 对 gateRaw 二次 Load）"的三趟访存。
+    // gateLast 指向 g_last（变长时为 gateRaw + chunkLen - 1）。
     constexpr uint32_t ELEMS_PER_VF = AscendC::VECTOR_REG_WIDTH / sizeof(float);
     const uint16_t loopCnt = static_cast<uint16_t>((elements + ELEMS_PER_VF - 1) / ELEMS_PER_VF);
+    const float ln2 = 0.69314718055994530942f;
 
     RegTensor<float> srcReg;
-    RegTensor<float> scalarReg;
-    RegTensor<float> dstReg;
+    RegTensor<float> lastReg;
+    RegTensor<float> factorReg;
+    RegTensor<float> dvReg;
     MaskReg maskLoop;
-    LoadIn<float, true>(scalarReg, scalar);
+    MaskReg maskFull = CreateMask<float, MaskPattern::ALL>();
+    LoadIn<float, true>(lastReg, gateLast);
+    if (useExp2) {
+        // ln2 必须乘在整个 (g_last - g) 上：exp(ln2*(g_last-g))
+        Muls(lastReg, lastReg, ln2, maskFull);
+    }
     for (uint16_t loopIdx = 0; loopIdx < loopCnt; ++loopIdx) {
         const uint32_t elemOffset = loopIdx * ELEMS_PER_VF;
         uint32_t curElems = elements - elemOffset > ELEMS_PER_VF ? ELEMS_PER_VF : elements - elemOffset;
         maskLoop = UpdateMask<float>(curElems);
-        LoadAlign(srcReg, src + elemOffset);
-        Sub(dstReg, scalarReg, srcReg, maskLoop);
+        LoadAlign(srcReg, gateRaw + elemOffset);
         if (useExp2) {
-            Muls(dstReg, dstReg, 0.69314718055994530942f, maskLoop);
+            Muls(factorReg, srcReg, ln2, maskLoop);
+            Sub(dvReg, lastReg, factorReg, maskLoop);
+        } else {
+            Sub(dvReg, lastReg, srcReg, maskLoop);
+            factorReg = srcReg;  // useExp2=false：gateFactor = exp(g)，srcReg 即操作数
         }
-        Exp(dstReg, dstReg, maskLoop);
-        StoreAlign(dst + elemOffset, dstReg, maskLoop);
+        Exp(factorReg, factorReg, maskLoop);
+        Exp(dvReg, dvReg, maskLoop);
+        StoreAlign(gateFactor + elemOffset, factorReg, maskLoop);
+        StoreAlign(dvGateFactor + elemOffset, dvReg, maskLoop);
+    }
+}
+
+__simd_vf__ inline void AddFloatTwoRegbase(__ubuf__ float *dst, __ubuf__ float *src1,
+                                           __ubuf__ float *src2, uint16_t elements)
+{
+    // fp32 += fp32 单 pass（USE_GK=1 的 dv2 合成：替换标量 AscendC::Add 与
+    // 其两侧 PipeBarrier；dst 可与 src1 地址重叠，寄存器内完成）
+    constexpr uint32_t ELEMS_PER_VF = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+    const uint16_t loopCnt = static_cast<uint16_t>((elements + ELEMS_PER_VF - 1) / ELEMS_PER_VF);
+
+    RegTensor<float> dstReg;
+    RegTensor<float> srcReg;
+    MaskReg maskFull = CreateMask<float, MaskPattern::ALL>();
+    #pragma unroll 2
+    for (uint16_t loopIdx = 0; loopIdx < loopCnt; ++loopIdx) {
+        const uint32_t elemOffset = loopIdx * ELEMS_PER_VF;
+        LoadAlign(dstReg, dst + elemOffset);
+        LoadAlign(srcReg, src2 + elemOffset);
+        Add(dstReg, dstReg, srcReg, maskFull);
+        StoreAlign(dst + elemOffset, dstReg, maskFull);
     }
 }
 
@@ -177,6 +217,40 @@ __simd_vf__ inline void MulRowsByFactorsAddRegbase(__ubuf__ float *dst, __ubuf__
             Mul(dstReg, srcReg, factorReg, maskFull);
             Add(dstReg, dstReg, addReg, maskFull);
             StoreAlign(dst + elemOffset, dstReg, maskFull);
+        }
+    }
+}
+
+template <typename DT>
+__simd_vf__ inline void MulRowsByFactorsAddCastOutRegbase(__ubuf__ DT *dst, __ubuf__ float *src,
+                                                          __ubuf__ float *factors, __ubuf__ float *add,
+                                                          uint16_t rowCount, uint16_t colCount)
+{
+    // dv2 尾部融合单 pass：×gate 因子 + 加 dv + fp32→DT cast 直写 outputBuf。
+    // 替换 MulRowsByFactorsAddRegbase（fp32 落 UB）+ PipeBarrier +
+    // CopyOutFp32Rows 的 cast 段——fp32 中间量只经寄存器不落 UB。
+    // RINT 舍入与原 AscendC::Cast(CAST_RINT) 一致（trait 同 opt2）。
+    constexpr uint32_t ELEMS_PER_VF = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+    const uint16_t colLoop = static_cast<uint16_t>((colCount + ELEMS_PER_VF - 1) / ELEMS_PER_VF);
+
+    RegTensor<float> srcReg;
+    RegTensor<float> factorReg;
+    RegTensor<float> addReg;
+    RegTensor<float> tmpReg;
+    RegTensor<DT> dstReg;
+    MaskReg maskFull32 = CreateMask<float, MaskPattern::ALL>();
+    #pragma unroll 2
+    for (uint16_t row = 0; row < rowCount; ++row) {
+        LoadIn<float, true>(factorReg, factors + row);
+        for (uint16_t colIdx = 0; colIdx < colLoop; ++colIdx) {
+            const uint32_t colOffset = colIdx * ELEMS_PER_VF;
+            const uint32_t elemOffset = row * colCount + colOffset;
+            LoadAlign(srcReg, src + elemOffset);
+            LoadAlign(addReg, add + elemOffset);
+            Mul(tmpReg, srcReg, factorReg, maskFull32);
+            Add(tmpReg, tmpReg, addReg, maskFull32);
+            Cast<DT, float, BWD_DHU_FP32_TO_DT_PACK<DT>>(dstReg, tmpReg, maskFull32);
+            StoreAlign<DT, StoreDist::DIST_PACK_B32>(dst + elemOffset, dstReg, maskFull32);
         }
     }
 }
@@ -444,6 +518,8 @@ public:
                     if constexpr (USE_GK == 0) {
                         AscendC::LocalTensor<float> gateRaw =
                             gRawAllFp32_.template Get<float>()[headOffset * gateElems_];
+                        AscendC::LocalTensor<float> dvGateFactor =
+                            dvGateFactorAllFp32_.template Get<float>()[headOffset * gateElems_];
                         const int64_t gateBase = (chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart;
                         const uint32_t gateIdx = CopyInGateRows(
                             gateGm_, gateInputBuf_[curGateInputPingPong_], gateBase,
@@ -451,16 +527,16 @@ public:
                         CastGateInputRows(gateRaw, gateInputBuf_[gateIdx],
                                           static_cast<uint32_t>(chunkInfo.chunkLen), gateIdx);
                         AscendC::PipeBarrier<PIPE_V>();
-                        if (tiling_->useExp2 != 0) {
-                            AscendC::Muls(gateFactor, gateRaw, LN2,
-                                          static_cast<uint32_t>(chunkInfo.chunkLen));
-                            AscendC::PipeBarrier<PIPE_V>();
-                            AscendC::Exp(gateFactor, gateFactor,
-                                         static_cast<uint32_t>(chunkInfo.chunkLen));
-                        } else {
-                            AscendC::Exp(gateFactor, gateRaw,
-                                         static_cast<uint32_t>(chunkInfo.chunkLen));
-                        }
+                        // gate 双系数合并单 pass：一次 Load 同时产 exp(g) 与 exp(g_last-g)
+                        // 两张驻留表（替换头部 Muls+Exp 两趟 + 尾部 ExpScalarSubFloat 一趟）
+                        const int64_t lastRow = chunkInfo.chunkLen - 1;
+                        GateDualFactorFuseRegbase(
+                            (__ubuf__ float *)reinterpret_cast<uint64_t>(gateFactor.GetPhyAddr()),
+                            (__ubuf__ float *)reinterpret_cast<uint64_t>(dvGateFactor.GetPhyAddr()),
+                            (__ubuf__ float *)reinterpret_cast<uint64_t>(gateRaw.GetPhyAddr()),
+                            static_cast<uint16_t>(chunkInfo.chunkLen),
+                            ((__ubuf__ float *)reinterpret_cast<uint64_t>(gateRaw.GetPhyAddr())) + lastRow,
+                            tiling_->useExp2 != 0);
                         AscendC::PipeBarrier<PIPE_V>();
                     } else {
                         const int64_t lastToken = chunkInfo.tokenStart + chunkInfo.chunkLen - 1;
@@ -549,19 +625,8 @@ public:
                             curOutputPingPong_ ^= 1U;
                         }
                     }
-                    if constexpr (USE_GK == 0) {
-                        const int64_t lastRow = chunkInfo.chunkLen - 1;
-                        AscendC::LocalTensor<float> gateRaw =
-                            gRawAllFp32_.template Get<float>()[headOffset * gateElems_];
-                        AscendC::LocalTensor<float> dvGateFactor =
-                            dvGateFactorAllFp32_.template Get<float>()[headOffset * gateElems_];
-                        ExpScalarSubFloatRegbase(
-                            (__ubuf__ float *)reinterpret_cast<uint64_t>(dvGateFactor.GetPhyAddr()),
-                            (__ubuf__ float *)reinterpret_cast<uint64_t>(gateRaw.GetPhyAddr()),
-                            ((__ubuf__ float *)reinterpret_cast<uint64_t>(gateRaw.GetPhyAddr())) + lastRow,
-                            static_cast<uint16_t>(chunkInfo.chunkLen), tiling_->useExp2 != 0);
-                        AscendC::PipeBarrier<PIPE_V>();
-                    }
+                    // dvGateFactor 已在 stage1 头部与 gateFactor 一次 Load 合并产出
+                    // （GateDualFactorFuseRegbase），此处无需再算
                     Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecToCubeFlag_);
                 }
                 for (int64_t headOffset = 0; headOffset < headCnt; ++headOffset) {
@@ -614,19 +679,35 @@ public:
                         CastInputRows(dvFp32, qInputBuf_[dvIdx], elems, dvIdx);
                         AscendC::PipeBarrier<PIPE_V>();
                         if constexpr (USE_GK == 0) {
+                            // dv2 尾部融合：×gate + 加 dv + cast 直写 outputBuf 单 pass
+                            // （消 MulRowsByFactorsAdd 的 fp32 落 UB、barrier 与
+                            // CopyOutFp32Rows 的独立 cast 段）；MTE3_V 等待时序与原
+                            // CopyOutFp32Rows 一致（写 outputBuf 前等上次 DataCopy 完成）
                             AscendC::LocalTensor<float> dvGateFactor =
                                 dvGateFactorAllFp32_.template Get<float>()[headOffset * gateElems_];
-                            MulRowsByFactorsAddRegbase(
-                                (__ubuf__ float *)reinterpret_cast<uint64_t>(outFp32.GetPhyAddr()),
+                            const uint32_t outputIdx = curOutputPingPong_;
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent_[outputIdx]);
+                            MulRowsByFactorsAddCastOutRegbase<DT>(
+                                (__ubuf__ DT *)reinterpret_cast<uint64_t>(outputBuf_[outputIdx].GetPhyAddr()),
                                 (__ubuf__ float *)reinterpret_cast<uint64_t>(outFp32.GetPhyAddr()),
                                 ((__ubuf__ float *)reinterpret_cast<uint64_t>(dvGateFactor.GetPhyAddr())) + rowOffset,
                                 (__ubuf__ float *)reinterpret_cast<uint64_t>(dvFp32.GetPhyAddr()),
                                 static_cast<uint16_t>(curRows), static_cast<uint16_t>(V_));
+                            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[outputIdx]);
+                            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[outputIdx]);
+                            AscendC::DataCopy(dv2Gm_[dvBase + rowElems], outputBuf_[outputIdx], elems);
+                            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent_[outputIdx]);
+                            curOutputPingPong_ ^= 1U;
                         } else {
-                            AscendC::Add(outFp32, outFp32, dvFp32, elems);
+                            // USE_GK=1 dv2 合成 VF 化：标量 Add → 单 pass 寄存器加
+                            AddFloatTwoRegbase(
+                                (__ubuf__ float *)reinterpret_cast<uint64_t>(outFp32.GetPhyAddr()),
+                                (__ubuf__ float *)reinterpret_cast<uint64_t>(outFp32.GetPhyAddr()),
+                                (__ubuf__ float *)reinterpret_cast<uint64_t>(dvFp32.GetPhyAddr()),
+                                static_cast<uint16_t>(elems));
+                            AscendC::PipeBarrier<PIPE_V>();
+                            CopyOutFp32Rows(dv2Gm_, outFp32, dvBase + rowElems, elems);
                         }
-                        AscendC::PipeBarrier<PIPE_V>();
-                        CopyOutFp32Rows(dv2Gm_, outFp32, dvBase + rowElems, elems);
                     }
                     Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecToCubeFlag_);
                 }
