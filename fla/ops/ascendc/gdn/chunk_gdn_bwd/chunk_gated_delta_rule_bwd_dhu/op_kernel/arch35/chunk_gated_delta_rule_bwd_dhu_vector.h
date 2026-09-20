@@ -511,6 +511,10 @@ public:
                     const int64_t dhBase = DhOffset(chunkInfo.bIdx, hv, chunkInfo.outputChunkIdx);
                     if (headOffset % subBlockNum_ != subBlockIdx_) {
                         Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecToCubeFlag_);
+                        // C3 配平：非归属 subblock 同点空转 set dhReady（cube 侧
+                        // 两个 mode-2 wait 各需两个 AIV 的计数）
+                        Catlass::Arch::CrossCoreFlag dhReadyFlag{DH_READY_FLAG};
+                        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(dhReadyFlag);
                         continue;
                     }
                     AscendC::LocalTensor<float> gateFactor =
@@ -577,6 +581,13 @@ public:
                         AscendC::PipeBarrier<PIPE_V>();
                         CopyOutStateRows(stateIdx, stateFp32, stateBase + rowOffset * V_, elems);
                     }
+
+                    // C3：dh 已全部写 GM（上面 state 行循环的 CopyOutFp32Rows 完成），
+                    // GEMM0 唯一跨核输入就绪——先于 qg 生成/dvGateFactor 发射 dhReady，
+                    // 让 cube 的 GEMM0 与本 AIV 的 qg 生成重叠。PIPE_MTE3 与 dh 的
+                    // MTE3 写同 pipe 保序。
+                    Catlass::Arch::CrossCoreFlag dhReadyFlag{DH_READY_FLAG};
+                    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(dhReadyFlag);
 
                     constexpr uint32_t c0Elems = 32 / sizeof(DT);
                     AscendC::DataCopyEnhancedParams qgCopyEnhanced;

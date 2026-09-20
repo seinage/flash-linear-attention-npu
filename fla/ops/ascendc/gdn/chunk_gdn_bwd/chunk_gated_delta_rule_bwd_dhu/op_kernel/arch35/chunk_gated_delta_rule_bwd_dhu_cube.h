@@ -261,7 +261,12 @@ public:
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(wEvent);
                     }
 
-                    Catlass::Arch::CrossCoreWaitFlag(vecToCubeFlag_);
+                    // C3 拆分：GEMM0 只消费 dh（vector S0 中段已写完），此处只等
+                    // dhReady 即可装载并启动 GEMM0；原 vecToCube wait（覆盖 qg/
+                    // dvGateFactor 全部产物）移至 GEMM1 前的 qg 消费点。
+                    // CrossCoreWaitFlag 收非 const 左值引用，临时量不可绑定，须先落局部变量
+                    Catlass::Arch::CrossCoreFlag dhReadyFlag{DH_READY_FLAG};
+                    Catlass::Arch::CrossCoreWaitFlag(dhReadyFlag);
 
                     auto tensorState = tla::MakeTensor(gmState, layoutState, Catlass::Arch::PositionGM{});
                     auto tensorDvState = tla::MakeTensor(gmDvState, layoutDvState, Catlass::Arch::PositionGM{});
@@ -433,6 +438,10 @@ public:
                     CopyL1ToL0A_TermQ copyL1ToL0A_TermQ;
                     CopyL1ToL0B_TermQ copyL1ToL0B_TermQ;
                     TileMmadTermQ tileMmadTermQ;
+
+                    // C3：GEMM1 消费 qg（vector S0 尾部经 MTE3 直写 L1A scratch），
+                    // 此处等原 vecToCube（覆盖 qg/dvGateFactor 全部 S0 产物）
+                    Catlass::Arch::CrossCoreWaitFlag(vecToCubeFlag_);
 
                     uint32_t qgScratchSlot = static_cast<uint32_t>(headOffset);
                     if (hasGk_) {
