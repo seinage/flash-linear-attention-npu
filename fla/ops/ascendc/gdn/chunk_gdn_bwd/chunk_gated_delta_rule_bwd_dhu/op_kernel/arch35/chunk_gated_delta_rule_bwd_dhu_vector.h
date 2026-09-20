@@ -371,6 +371,10 @@ public:
         if (subBlockIdx_ < 0 || subBlockIdx_ >= subBlockNum_) {
             subBlockIdx_ = 0;
         }
+        // state UB 驻留：tiling 预算允许时启用；kernel 侧防御性复核（subBlockNum<2
+        // 时 owned head 可能超 2 个槽位、K*V 超 FillFloatRegbase 的 uint16 上限），
+        // 复核不过则回退 GM 往返路径（tile 态 buffer 更小，预算必然够）
+        stateResident_ = tiling_->stateResident != 0 && subBlockNum_ >= 2 && K_ * V_ <= 65535;
 
         const int64_t inputElems = vecRow_ * (K_ > V_ ? K_ : V_);
         const int64_t outputRows = vecRow_ > 16 ? vecRow_ : 16;
@@ -385,8 +389,11 @@ public:
         pipe_->InitBuffer(gInputPong_, gateElems_ * static_cast<int64_t>(sizeof(GT)));
         pipe_->InitBuffer(outputPing_, outputElems * static_cast<int64_t>(sizeof(DT)));
         pipe_->InitBuffer(outputPong_, outputElems * static_cast<int64_t>(sizeof(DT)));
-        pipe_->InitBuffer(statePing_, vecRow_ * V_ * static_cast<int64_t>(sizeof(float)));
-        pipe_->InitBuffer(statePong_, vecRow_ * V_ * static_cast<int64_t>(sizeof(float)));
+        // 驻留态按全量 [K,V] fp32 分配（ping/pong 复用为 owned head 槽位）；
+        // GM 往返态按行 tile 分配（原行为）
+        const int64_t stateBufElems = stateResident_ ? K_ * V_ : vecRow_ * V_;
+        pipe_->InitBuffer(statePing_, stateBufElems * static_cast<int64_t>(sizeof(float)));
+        pipe_->InitBuffer(statePong_, stateBufElems * static_cast<int64_t>(sizeof(float)));
         pipe_->InitBuffer(qFp32Buf_, inputElems * static_cast<int64_t>(sizeof(float)));
         pipe_->InitBuffer(gateFactorAllFp32_, HEADS_PER_TASK * gateElems_ * static_cast<int64_t>(sizeof(float)));
         if constexpr (USE_GK == 0) {
@@ -476,6 +483,14 @@ public:
                 if (headOffset % subBlockNum_ != subBlockIdx_) {
                     continue;
                 }
+                if (stateResident_) {
+                    // 驻留态：直接清 UB 槽位（workspace state 段不再读写）
+                    AscendC::LocalTensor<float> stateFp32 = stateBuf_[StateResidentSlot(headOffset)];
+                    FillFloatRegbase((__ubuf__ float *)reinterpret_cast<uint64_t>(stateFp32.GetPhyAddr()),
+                                     0.0f, static_cast<uint16_t>(K_ * V_));
+                    AscendC::PipeBarrier<PIPE_V>();
+                    continue;
+                }
                 const int64_t workspaceBase = WorkspaceBase(coreIdx, windowStartSlot + headOffset);
                 const int64_t stateBase = StateWorkspaceFloatOffset(workspaceBase, 0);
                 for (int64_t rowOffset = 0; rowOffset < K_; rowOffset += vecRow_) {
@@ -559,6 +574,29 @@ public:
                     for (int64_t rowOffset = 0; rowOffset < K_; rowOffset += vecRow_) {
                         const int64_t curRows = Min(vecRow_, K_ - rowOffset);
                         const uint32_t elems = static_cast<uint32_t>(curRows * V_);
+                        if (stateResident_) {
+                            // 驻留态：state 常驻 UB 槽位，行 tile 原位读改（无 GM 往返）。
+                            // dh 输出 decay 前状态、随后原位 decay，均由 V pipe 顺序保证
+                            AscendC::LocalTensor<float> stateFp32 =
+                                stateBuf_[StateResidentSlot(headOffset)][rowOffset * V_];
+                            CopyOutFp32Rows(dhGm_, stateFp32, dhBase + rowOffset * V_, elems);
+                            if constexpr (USE_GK == 0) {
+                                const int64_t lastRow = chunkInfo.chunkLen - 1;
+                                MulScalarPtrRegbase(
+                                    (__ubuf__ float *)reinterpret_cast<uint64_t>(stateFp32.GetPhyAddr()),
+                                    (__ubuf__ float *)reinterpret_cast<uint64_t>(stateFp32.GetPhyAddr()),
+                                    ((__ubuf__ float *)reinterpret_cast<uint64_t>(gateFactor.GetPhyAddr())) + lastRow,
+                                    static_cast<uint16_t>(elems));
+                            } else {
+                                MulRowsByFactorsRegbase(
+                                    (__ubuf__ float *)reinterpret_cast<uint64_t>(stateFp32.GetPhyAddr()),
+                                    (__ubuf__ float *)reinterpret_cast<uint64_t>(stateFp32.GetPhyAddr()),
+                                    ((__ubuf__ float *)reinterpret_cast<uint64_t>(gateFactor.GetPhyAddr())) + rowOffset,
+                                    static_cast<uint16_t>(curRows), static_cast<uint16_t>(V_));
+                            }
+                            AscendC::PipeBarrier<PIPE_V>();
+                            continue;
+                        }
                         const uint32_t stateIdx = CopyInStateRows(
                             stateBuf_[curStatePingPong_], stateBase + rowOffset * V_, elems);
                         AscendC::LocalTensor<float> stateFp32 = stateBuf_[stateIdx];
@@ -743,8 +781,13 @@ public:
                         const uint32_t termQIdx = CopyInRows(
                             workspaceGm_, qInputBuf_[curQInputPingPong_], termQBase + rowElems, elems);
                         CastInputRows(termQFp32, qInputBuf_[termQIdx], elems, termQIdx);
-                        const uint32_t stateIdx = CopyInStateRows(
-                            stateBuf_[curStatePingPong_], stateBase + rowElems, elems);
+                        // termW 填充（CV 握手 / GM 读）所有路径必须执行：
+                        // 驻留态跳过它会导致 AIV 不消费 CV tile、mode-4 握手失衡（上轮 v1 崩溃根因）
+                        uint32_t stateIdx = 0;
+                        if (!stateResident_) {
+                            stateIdx = CopyInStateRows(
+                                stateBuf_[curStatePingPong_], stateBase + rowElems, elems);
+                        }
                         if constexpr (std::is_same<DT, bfloat16_t>::value) {
                             const bool useGmTermW = V_ == 256 && chunkInfo.chunkLen > 64;
                             if (useGmTermW) {
@@ -768,6 +811,22 @@ public:
                             const uint32_t termWIdx = CopyInRows(
                                 workspaceGm_, qInputBuf_[curQInputPingPong_], termWBase + rowElems, elems);
                             CastInputRows(outFp32, qInputBuf_[termWIdx], elems, termWIdx);
+                        }
+                        if (stateResident_) {
+                            // 驻留态：state 常驻 UB 槽位，行 tile 原位累加（无 GM 往返）。
+                            // termQ/outFp32 均由 V pipe 先序填充（CastInputRows/CV 消费），
+                            // 同 pipe 保序；state 不经 MTE，无需 state 事件
+                            AscendC::LocalTensor<float> stateFp32 =
+                                stateBuf_[StateResidentSlot(headOffset)][rowElems];
+                            AscendC::PipeBarrier<PIPE_V>();
+                            const float scaleLocal = scale_;
+                            StateUpdateFuseRegbase(
+                                (__ubuf__ float *)reinterpret_cast<uint64_t>(stateFp32.GetPhyAddr()),
+                                (__ubuf__ float *)reinterpret_cast<uint64_t>(termQFp32.GetPhyAddr()),
+                                (__ubuf__ float *)reinterpret_cast<uint64_t>(outFp32.GetPhyAddr()),
+                                scaleLocal, static_cast<uint16_t>(elems));
+                            AscendC::PipeBarrier<PIPE_V>();
+                            continue;
                         }
                         AscendC::LocalTensor<float> stateFp32 = stateBuf_[stateIdx];
                         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(stateMte2ToVEvent_[stateIdx]);
@@ -794,7 +853,20 @@ public:
                     const int64_t workspaceSlot = windowStartSlot + headOffset;
                     const int64_t workspaceBase = WorkspaceBase(coreIdx, workspaceSlot);
                     const int64_t hv = hvBase + headOffset;
+                    // dh0 偏移按 main 侧 cd357a66 融合接口约定简化（不再按变长
+                    // outputChunkIdx 查找）；opt7 驻留分支叠加其上
                     const int64_t dh0Base = (seqIdx * HV_ + hv) * K_ * V_;
+                    if (stateResident_) {
+                        // 驻留态：state 常驻 UB 槽位，直接行 tile 输出（无 GM 读回）
+                        for (int64_t rowOffset = 0; rowOffset < K_; rowOffset += vecRow_) {
+                            const int64_t curRows = Min(vecRow_, K_ - rowOffset);
+                            const uint32_t elems = static_cast<uint32_t>(curRows * V_);
+                            AscendC::LocalTensor<float> stateFp32 =
+                                stateBuf_[StateResidentSlot(headOffset)][rowOffset * V_];
+                            CopyOutFp32Rows(dh0Gm_, stateFp32, dh0Base + rowOffset * V_, elems);
+                        }
+                        continue;
+                    }
                     const int64_t stateBase = StateWorkspaceFloatOffset(workspaceBase, 0);
                     if (!stateVFirst_) {
                         for (int64_t rowOffset = 0; rowOffset < K_; rowOffset += vecRow_) {
@@ -1019,6 +1091,13 @@ private:
         return inputIdx;
     }
 
+    __aicore__ inline uint32_t StateResidentSlot(int64_t headOffset) const
+    {
+        // 驻留态槽位 = 本 subblock 拥有的 head 序号（headsPerTask<=HEADS_PER_TASK=4、
+        // subBlockNum>=2 时最多 2 个 owned head，ping/pong 恰好够用）
+        return static_cast<uint32_t>((headOffset / subBlockNum_) & 1);
+    }
+
     __aicore__ inline void CopyOutStateRows(uint32_t stateIdx, AscendC::LocalTensor<float> srcTensor,
                                             int64_t outOffset, uint32_t elements)
     {
@@ -1119,6 +1198,7 @@ private:
     float scale_ = 1.0f;
     bool hasDh0_ = false;
     bool stateVFirst_ = false;
+    bool stateResident_ = false;
     int64_t dh0ClearCoreNum_ = 0;
     int64_t dh0ClearElemsPerCore_ = 0;
     int64_t dh0ClearTailElems_ = 0;

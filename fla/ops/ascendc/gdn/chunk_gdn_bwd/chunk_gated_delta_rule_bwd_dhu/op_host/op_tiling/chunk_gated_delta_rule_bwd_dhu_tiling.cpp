@@ -118,6 +118,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdDhu(gert::TilingContext *context)
         useExp2Ptr != nullptr ? *useExp2Ptr : false,
         stateVFirstPtr != nullptr ? *stateVFirstPtr : false,
         h0InputShape != nullptr,
+        ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950,
         true,
         scalePtr != nullptr ? static_cast<double>(*scalePtr) : 1.0,
         chunkSizePtr != nullptr ? *chunkSizePtr : 64,
